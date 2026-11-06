@@ -66,6 +66,7 @@ class ToolConfig:
     version: str
     output: str
     ascii_tree: bool
+    reverse: bool
 
     def describe(self):
         """Return the key: value lines of all parameters."""
@@ -76,6 +77,7 @@ class ToolConfig:
             f"version: {self.version}",
             f"output: {self.output}",
             f"ascii_tree: {bool_text(self.ascii_tree)}",
+            f"reverse: {bool_text(self.reverse)}",
         ]
 
 def bool_text(value):
@@ -87,6 +89,7 @@ def build_config(args):
     errors = []
     test_mode = parse_bool(args.test_mode, "--test-mode", errors)
     ascii_tree = parse_bool(args.ascii_tree, "--ascii-tree", errors)
+    reverse = parse_bool(args.reverse, "--reverse", errors)
     check_package(args.package, test_mode, errors)
     check_repo(args.repo, test_mode, errors)
     check_version(args.version, errors)
@@ -100,6 +103,7 @@ def build_config(args):
         version=args.version,
         output=args.output,
         ascii_tree=ascii_tree,
+        reverse=reverse,
     )
 
 def parse_bool(value, option, errors):
@@ -733,6 +737,42 @@ def build_graph(source, root_package):
             queue.append(child)
     return dependency_graph
 
+def build_full_graph(repository):
+    """Build the graph of every package of the test repository."""
+    dependency_graph = DependencyGraph()
+    for name in repository.names():
+        dependency_graph.add_package(repository.resolve(name))
+    for name in repository.names():
+        for dependency, _ in repository.packages[name]:
+            dependency_graph.add_edge(name, dependency)
+    return dependency_graph
+
+def reverse_edges(dependency_graph):
+    """Build a graph with the same packages and inverted edges."""
+    inverted = DependencyGraph()
+    for key in dependency_graph.order:
+        inverted.add_package(dependency_graph.packages[key])
+    for source, target in dependency_graph.edges:
+        inverted.add_edge(target, source)
+    return inverted
+
+def reachable(dependency_graph, start_key):
+    """Return the keys reachable from start_key in BFS order."""
+    if start_key not in dependency_graph.packages:
+        return []
+    order = []
+    visited = {start_key}
+    queue = deque([start_key])
+    while queue:
+        current = queue.popleft()
+        for child in dependency_graph.children(current):
+            if child in visited:
+                continue
+            visited.add(child)
+            order.append(child)
+            queue.append(child)
+    return order
+
 def resolve_dependency(source, current, name, requirement,
                        dependency_graph):
     """Resolve one dependency and remember the problem if it fails."""
@@ -765,12 +805,26 @@ EXIT_SOURCE = 3
 
 DEFAULT_REPO = "https://registry.npmjs.org"
 
+REVERSE_REQUIRES_TEST = (
+    "Ошибка: обратные зависимости вычисляются только в тестовом режиме, "
+    "где известен весь граф зависимостей.")
+
 def parse_args(argv=None):
     """Parse the command line parameters of the visualizer."""
+    return build_parser().parse_args(argv)
+
+def build_parser():
+    """Create the argument parser with every option of the tool."""
     parser = argparse.ArgumentParser(
         prog=PROGRAM_NAME,
         description=DESCRIPTION,
     )
+    add_input_options(parser)
+    add_output_options(parser)
+    return parser
+
+def add_input_options(parser):
+    """Register the options that select the package and its source."""
     parser.add_argument(
         "--package",
         required=True,
@@ -792,6 +846,9 @@ def parse_args(argv=None):
         required=True,
         help="версия пакета или слово latest",
     )
+
+def add_output_options(parser):
+    """Register the options that control the report and the image."""
     parser.add_argument(
         "--output",
         required=True,
@@ -803,7 +860,12 @@ def parse_args(argv=None):
         metavar="true|false",
         help="вывод зависимостей в виде ASCII-дерева",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--reverse",
+        default="false",
+        metavar="true|false",
+        help="вывод пакетов, которые зависят от заданного",
+    )
 
 def show_config(tool_config):
     """Print every parameter of the run as a key: value line."""
@@ -816,8 +878,8 @@ def create_source(tool_config):
         return TestRepository(tool_config.repo)
     return RegistryClient(tool_config.repo)
 
-def show_graph(dependency_graph):
-    """Print the graph summary and the packages in BFS order."""
+def show_summary(dependency_graph):
+    """Print the size of the graph and its cycle information."""
     print(f"Граф зависимостей {dependency_graph.root()}:")
     print(f"  всего пакетов: {len(dependency_graph.order)}")
     print(f"  всего связей: {len(dependency_graph.edges)}")
@@ -826,10 +888,45 @@ def show_graph(dependency_graph):
         print("  цикл: " + " -> ".join(cycle))
     else:
         print("  циклов нет")
+
+def show_forward(dependency_graph):
+    """Print the packages in the order of the BFS traversal."""
     print("Пакеты в порядке обхода BFS:")
     for key in dependency_graph.order:
         count = len(dependency_graph.children(key))
         print(f"  {key} ({count})")
+
+def show_reverse(dependency_graph, target_key):
+    """Print the packages that depend on the requested package."""
+    inverted = reverse_edges(dependency_graph)
+    dependents = reachable(inverted, target_key)
+    print(f"Обратные зависимости для {target_key}:")
+    if not dependents:
+        print("  (нет)")
+        return
+    print(f"  всего пакетов: {len(dependents)}")
+    for key in dependents:
+        print(f"  {key}")
+
+def run_reverse(tool_config):
+    """Show the packages that depend on the requested package."""
+    if not tool_config.test_mode:
+        print(REVERSE_REQUIRES_TEST, file=sys.stderr)
+        return EXIT_SOURCE
+    try:
+        repository = TestRepository(tool_config.repo)
+        full_graph = build_full_graph(repository)
+    except SourceError as exc:
+        print(f"Ошибка источника: {exc}", file=sys.stderr)
+        return EXIT_SOURCE
+    if tool_config.package not in full_graph.packages:
+        print(f"Ошибка источника: пакет '{tool_config.package}' "
+              "не найден в тестовом репозитории", file=sys.stderr)
+        return EXIT_SOURCE
+    print(f"Граф тестового репозитория: пакетов {len(full_graph.order)}, "
+          f"связей {len(full_graph.edges)}")
+    show_reverse(full_graph, tool_config.package)
+    return EXIT_OK
 
 def show_problems(dependency_graph):
     """Print dependencies that could not be resolved."""
@@ -839,6 +936,8 @@ def show_problems(dependency_graph):
 
 def run(tool_config):
     """Build the dependency graph and print it."""
+    if tool_config.reverse:
+        return run_reverse(tool_config)
     try:
         source = create_source(tool_config)
         root_package = source.resolve(tool_config.package,
@@ -847,7 +946,8 @@ def run(tool_config):
     except SourceError as exc:
         print(f"Ошибка источника: {exc}", file=sys.stderr)
         return EXIT_SOURCE
-    show_graph(dependency_graph)
+    show_summary(dependency_graph)
+    show_forward(dependency_graph)
     show_problems(dependency_graph)
     return EXIT_OK
 

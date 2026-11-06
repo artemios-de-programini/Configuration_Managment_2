@@ -8,11 +8,9 @@ function Run-Py {
 }
 
 $repo = ".\tests\test_repo.txt"
+$cycleRepo = ".\tests\test_repo3.txt"
 $temp = Join-Path $env:TEMP "depgraph_tests"
 New-Item -ItemType Directory -Force $temp | Out-Null
-
-$cycle = Join-Path $temp "repo_cycle.txt"
-Set-Content -Path $cycle -Encoding ASCII -Value @("A: B", "B: C", "C: A")
 
 $self = Join-Path $temp "repo_self.txt"
 Set-Content -Path $self -Encoding ASCII -Value @("A: A B", "B:")
@@ -27,7 +25,7 @@ Write-Host "`n--- 2. Подграф от пакета B ---"
 Run-Py src/Main.py --package B --repo $repo --test-mode true --version 1.0.0 --output graph.svg
 
 Write-Host "`n--- 3. Циклическая зависимость A -> B -> C -> A ---"
-Run-Py src/Main.py --package A --repo $cycle --test-mode true --version 1.0.0 --output graph.svg
+Run-Py src/Main.py --package A --repo $cycleRepo --test-mode true --version 1.0.0 --output graph.svg
 
 Write-Host "`n--- 4. Пакет, зависящий сам от себя ---"
 Run-Py src/Main.py --package A --repo $self --test-mode true --version 1.0.0 --output graph.svg
